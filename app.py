@@ -290,7 +290,89 @@ Launch metadata:
 @st.cache_data(ttl=300)
 def get_upcoming_launches():
     url = "https://ll.thespacedevs.com/2.2.0/launch/upcoming/?limit=15&mode=detailed"
-    response = requests.get(url, timeout=20)
+    @st.cache_data(ttl=300)
+def fetch_json_with_retry(url, timeout=45, retries=3):
+    last_error = None
+
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            last_error = e
+
+    raise last_error
+
+
+@st.cache_data(ttl=300)
+def get_upcoming_launches():
+    url = "https://ll.thespacedevs.com/2.2.0/launch/upcoming/?limit=15&mode=detailed"
+    raw = fetch_json_with_retry(url)["results"]
+
+    rows = []
+    for item in raw:
+        pad = item.get("pad") or {}
+        location = pad.get("location") or {}
+
+        rows.append(
+            {
+                "name": item.get("name"),
+                "net": item.get("net"),
+                "status": item.get("status", {}).get("name") if item.get("status") else None,
+                "provider": item.get("launch_service_provider", {}).get("name")
+                if item.get("launch_service_provider")
+                else None,
+                "rocket": item.get("rocket", {}).get("configuration", {}).get("name")
+                if item.get("rocket") and item.get("rocket", {}).get("configuration")
+                else None,
+                "mission_type": item.get("mission", {}).get("type") if item.get("mission") else None,
+                "location_name": location.get("name"),
+                "country_code": location.get("country_code"),
+                "lat": pd.to_numeric(pad.get("latitude"), errors="coerce"),
+                "lon": pd.to_numeric(pad.get("longitude"), errors="coerce"),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    df = clean_time_col(df, "net")
+    if not df.empty:
+        df = df.sort_values("net")
+    return df
+
+
+@st.cache_data(ttl=300)
+def get_recent_launches():
+    url = "https://ll.thespacedevs.com/2.2.0/launch/previous/?limit=40&mode=detailed"
+    raw = fetch_json_with_retry(url)["results"]
+
+    rows = []
+    for item in raw:
+        pad = item.get("pad") or {}
+        location = pad.get("location") or {}
+
+        rows.append(
+            {
+                "name": item.get("name"),
+                "net": item.get("net"),
+                "status": item.get("status", {}).get("name") if item.get("status") else None,
+                "provider": item.get("launch_service_provider", {}).get("name")
+                if item.get("launch_service_provider")
+                else None,
+                "rocket": item.get("rocket", {}).get("configuration", {}).get("name")
+                if item.get("rocket") and item.get("rocket", {}).get("configuration")
+                else None,
+                "mission_type": item.get("mission", {}).get("type") if item.get("mission") else None,
+                "location_name": location.get("name"),
+                "country_code": location.get("country_code"),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    df = clean_time_col(df, "net")
+    if not df.empty:
+        df = df.sort_values("net", ascending=False)
+    return df
     response.raise_for_status()
     raw = response.json()["results"]
 
