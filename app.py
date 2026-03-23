@@ -15,7 +15,9 @@ except Exception:
 st.set_page_config(page_title="Orbital Launch Monitor", layout="wide")
 
 st.title("Orbital Launch Monitor")
-st.caption("A live dashboard for upcoming launches, recent failed launches, publicly labeled sensitive missions, and AI-assisted OSINT inference.")
+st.caption(
+    "A live dashboard for upcoming launches, recent failed launches, publicly labeled sensitive missions, and AI-assisted OSINT inference."
+)
 
 
 # CONFIG
@@ -68,7 +70,8 @@ def get_openai_api_key():
 def classify_sensitive_launch(row: pd.Series) -> dict:
     """
     Rule-based fallback inference using only public metadata.
-    This works even if no OpenAI key is configured.
+    This version aims to always provide a mission-specific explanation,
+    not a generic 'classified/national security' answer.
     """
     name = safe_text(row.get("name")).lower()
     mission_type = safe_text(row.get("mission_type")).lower()
@@ -81,61 +84,124 @@ def classify_sensitive_launch(row: pd.Series) -> dict:
     text = " ".join([name, mission_type, provider, rocket, location_name, country_code, status])
 
     evidence = []
-    likely_type = "Unknown sensitive payload"
-    why_sensitive = "Public metadata suggests a government or national-security-linked mission, but the exact payload is not disclosed."
-    confidence = 0.45
+    likely_type = "Sensitive government payload"
+    why_sensitive = (
+        "This mission most likely supports government or military space operations, "
+        "and missions in that category are often described vaguely to avoid revealing capability, customer, or purpose."
+    )
+    confidence = 0.55
 
+    # Mission-family-specific explanations
     if "nrol" in text:
         likely_type = "Reconnaissance / intelligence satellite"
-        why_sensitive = "NROL missions are typically associated with the U.S. National Reconnaissance Office and are commonly classified because they support intelligence collection."
+        why_sensitive = (
+            "NROL missions are typically linked to the U.S. National Reconnaissance Office, "
+            "which operates intelligence-gathering satellites. Launches in this family are usually kept vague "
+            "because they can involve imaging, signals collection, or other surveillance capabilities."
+        )
         confidence = 0.86
         evidence.append("Mission name includes NROL")
 
     elif "yaogan" in text:
         likely_type = "Remote sensing / military ISR satellite"
-        why_sensitive = "Yaogan missions are widely associated with Chinese reconnaissance and remote sensing activity."
+        why_sensitive = (
+            "Yaogan missions are widely associated with Chinese reconnaissance and remote sensing activity. "
+            "They are often treated as sensitive because they may support surveillance, maritime tracking, "
+            "or broader military intelligence functions."
+        )
         confidence = 0.82
         evidence.append("Mission name includes Yaogan")
 
     elif "reconnaissance" in text:
         likely_type = "Reconnaissance / surveillance payload"
-        why_sensitive = "The mission is publicly labeled as reconnaissance, which strongly suggests intelligence, monitoring, or ISR use."
+        why_sensitive = (
+            "The mission is publicly described as reconnaissance, which strongly suggests an intelligence, "
+            "monitoring, or ISR role. Payloads in this category are often sensitive because they reveal how a state "
+            "collects information from orbit."
+        )
         confidence = 0.82
         evidence.append("Mission type or name includes reconnaissance")
 
     elif "surveillance" in text:
         likely_type = "Surveillance / ISR payload"
-        why_sensitive = "The mission is publicly labeled as surveillance, which points to monitoring or intelligence-gathering functions."
+        why_sensitive = (
+            "The mission is labeled as surveillance, which usually points to monitoring, tracking, "
+            "or intelligence-gathering activity. Missions like this are often kept partially vague because "
+            "their collection targets or technical capability may be strategically important."
+        )
         confidence = 0.79
         evidence.append("Mission type or name includes surveillance")
 
-    elif "classified" in text or "top secret" in text or "national security" in text:
-        likely_type = "Classified national security mission"
-        why_sensitive = "The public metadata itself marks the mission as classified or national security-related."
+    elif "national security" in text:
+        likely_type = "National security space mission"
+        why_sensitive = (
+            "The mission is publicly framed as a national security launch, which usually means it supports "
+            "defense, intelligence, missile warning, secure communications, or orbital monitoring. "
+            "Those missions are often sensitive because detailed disclosure could expose strategic capability."
+        )
         confidence = 0.78
-        evidence.append("Public metadata includes classified/national security wording")
+        evidence.append("Public metadata includes national security wording")
 
-    elif "military" in text or "government" in text:
-        likely_type = "Government or military support payload"
-        why_sensitive = "Government and military missions are often described vaguely to avoid disclosing capability, customer, or operational purpose."
-        confidence = 0.70
-        evidence.append("Public metadata includes government/military wording")
+    elif "classified" in text or "top secret" in text or "secret" in text:
+        likely_type = "Classified government mission"
+        why_sensitive = (
+            "The mission is explicitly described as classified or secret, which usually indicates a payload tied to "
+            "defense, intelligence, or another restricted government function. Public details are often limited to avoid "
+            "revealing the system’s exact role or capability."
+        )
+        confidence = 0.77
+        evidence.append("Public metadata includes classified/secret wording")
 
-    # Provider / site pattern enhancements
+    elif "military" in text:
+        likely_type = "Military support payload"
+        why_sensitive = (
+            "The mission appears linked to military activity, which often means it supports communications, surveillance, "
+            "navigation, early warning, or other operational functions. Payloads in these roles are commonly described vaguely "
+            "to avoid exposing their usefulness in conflict or strategic planning."
+        )
+        confidence = 0.73
+        evidence.append("Public metadata includes military wording")
+
+    elif "government" in text:
+        likely_type = "Government operational payload"
+        why_sensitive = (
+            "The mission appears to be a government payload rather than a commercial one. Government missions are often more "
+            "sensitive because they can support state communications, observation, science with dual-use value, or other public-sector operations."
+        )
+        confidence = 0.68
+        evidence.append("Public metadata includes government wording")
+
+    # Provider / launcher pattern refinements
     if "spacex" in text and "nrol" in text:
         evidence.append("Pattern resembles recent Falcon 9 NRO mission profiles")
         confidence = max(confidence, 0.86)
 
     if "united launch alliance" in text or "ula" in text:
         evidence.append("ULA frequently launches U.S. national security payloads")
+        if likely_type == "Sensitive government payload":
+            likely_type = "Possible U.S. national security payload"
+            why_sensitive = (
+                "This mission uses a launch provider strongly associated with U.S. government and defense launches. "
+                "That makes it more likely to involve a payload with military, intelligence, or strategic support value."
+            )
         confidence = max(confidence, 0.73)
 
     if "northrop grumman" in text:
         evidence.append("Northrop Grumman commonly supports defense missions")
+        if likely_type == "Sensitive government payload":
+            likely_type = "Possible defense-linked payload"
+            why_sensitive = (
+                "This mission is associated with a contractor that regularly supports defense and national security programs, "
+                "which increases the chance that the payload has military or intelligence relevance."
+            )
         confidence = max(confidence, 0.72)
 
     if "rocket lab" in text and ("government" in text or "military" in text):
         evidence.append("Rocket Lab increasingly launches security-linked payloads")
+        confidence = max(confidence, 0.66)
+
+    if "roscosmos" in text and ("military" in text or "government" in text):
+        evidence.append("Roscosmos missions can include state-directed or dual-use payloads")
         confidence = max(confidence, 0.66)
 
     if "vandenberg" in text:
@@ -145,7 +211,7 @@ def classify_sensitive_launch(row: pd.Series) -> dict:
         evidence.append("Florida launch sites are often used for strategic U.S. government missions")
 
     if not evidence:
-        evidence.append("Inference based on public sensitive labels and provider patterns")
+        evidence.append("Inference based on public mission labels and launch pattern")
 
     return {
         "likely_type": likely_type,
@@ -180,13 +246,13 @@ def infer_sensitive_launch_ai(row: pd.Series, model: str = "gpt-5.2") -> dict:
 You are an aerospace OSINT analyst.
 
 A launch has been flagged as publicly sensitive based on public metadata.
-Using ONLY the metadata below, infer the most likely reason it may be sensitive or secret.
+Using ONLY the metadata below, infer the most likely mission category and explain specifically why a mission of this type would be considered sensitive.
 
 Rules:
 - Do not claim certainty.
 - Use cautious language.
-- Give the most likely mission category.
-- Explain why missions like this are often sensitive/classified.
+- Do not give a generic answer like "it is classified" or "it is national security-related."
+- Explain the likely operational reason it is sensitive, such as reconnaissance, ISR, military communications, missile warning, government monitoring, or strategic support.
 - Base your answer only on the metadata below.
 - Return valid JSON only.
 
@@ -337,7 +403,6 @@ if not recent_launches_df.empty:
     provider_series = recent_launches_df["provider"].fillna("").str.lower()
     name_series = recent_launches_df["name"].fillna("").str.lower()
 
-    # Smarter sensitive detection so normal launches from big providers aren't all flagged
     sensitive_mask = (
         mission_series.apply(lambda x: any(k in x for k in SENSITIVE_KEYWORDS))
         | name_series.apply(lambda x: any(k in x for k in SENSITIVE_KEYWORDS))
@@ -527,7 +592,9 @@ st.divider()
 # AI INFERENCE ON SENSITIVE LAUNCHES
 
 st.subheader("AI Inference on Sensitive Launches")
-st.caption("Best-effort OSINT estimate of why a publicly labeled sensitive mission may be sensitive. This is not confirmation of the real payload.")
+st.caption(
+    "Best-effort OSINT estimate of why a publicly labeled sensitive mission may be sensitive. This is not confirmation of the real payload."
+)
 
 if recent_launch_error:
     st.error(f"Recent launch history unavailable: {recent_launch_error}")
