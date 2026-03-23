@@ -1,8 +1,9 @@
 import os
 import json
+import time
+import requests
 import streamlit as st
 import pandas as pd
-import requests
 import plotly.express as px
 
 try:
@@ -20,7 +21,9 @@ st.caption(
 )
 
 
+# =========================
 # CONFIG
+# =========================
 
 SENSITIVE_KEYWORDS = [
     "government/top secret",
@@ -44,8 +47,16 @@ WATCHED_PROVIDERS = [
     "roscosmos",
 ]
 
+UPCOMING_LIMIT = 15
+RECENT_LIMIT = 40
+REQUEST_TIMEOUT = 45
+REQUEST_RETRIES = 3
+CACHE_TTL_SECONDS = 300
 
+
+# =========================
 # HELPERS
+# =========================
 
 def safe_text(value):
     return "" if value is None else str(value)
@@ -67,11 +78,58 @@ def get_openai_api_key():
     return os.getenv("OPENAI_API_KEY")
 
 
+def fetch_json_with_retry(url: str, timeout: int = REQUEST_TIMEOUT, retries: int = REQUEST_RETRIES):
+    last_error = None
+
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            last_error = e
+            if attempt < retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+
+    raise last_error
+
+
+def build_launch_rows(raw_results, include_coordinates: bool) -> pd.DataFrame:
+    rows = []
+
+    for item in raw_results:
+        pad = item.get("pad") or {}
+        location = pad.get("location") or {}
+        mission = item.get("mission") or {}
+        rocket = item.get("rocket") or {}
+        configuration = rocket.get("configuration") or {}
+        provider = item.get("launch_service_provider") or {}
+        status = item.get("status") or {}
+
+        row = {
+            "name": item.get("name"),
+            "net": item.get("net"),
+            "status": status.get("name"),
+            "provider": provider.get("name"),
+            "rocket": configuration.get("name"),
+            "mission_type": mission.get("type"),
+            "location_name": location.get("name"),
+            "country_code": location.get("country_code"),
+        }
+
+        if include_coordinates:
+            row["lat"] = pd.to_numeric(pad.get("latitude"), errors="coerce")
+            row["lon"] = pd.to_numeric(pad.get("longitude"), errors="coerce")
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
 def classify_sensitive_launch(row: pd.Series) -> dict:
     """
     Rule-based fallback inference using only public metadata.
-    This version aims to always provide a mission-specific explanation,
-    not a generic 'classified/national security' answer.
+    Aims to produce mission-specific explanations instead of generic ones.
     """
     name = safe_text(row.get("name")).lower()
     mission_type = safe_text(row.get("mission_type")).lower()
@@ -91,7 +149,6 @@ def classify_sensitive_launch(row: pd.Series) -> dict:
     )
     confidence = 0.55
 
-    # Mission-family-specific explanations
     if "nrol" in text:
         likely_type = "Reconnaissance / intelligence satellite"
         why_sensitive = (
@@ -171,7 +228,6 @@ def classify_sensitive_launch(row: pd.Series) -> dict:
         confidence = 0.68
         evidence.append("Public metadata includes government wording")
 
-    # Provider / launcher pattern refinements
     if "spacex" in text and "nrol" in text:
         evidence.append("Pattern resembles recent Falcon 9 NRO mission profiles")
         confidence = max(confidence, 0.86)
@@ -223,7 +279,7 @@ def classify_sensitive_launch(row: pd.Series) -> dict:
 
 def infer_sensitive_launch_ai(row: pd.Series, model: str = "gpt-5.2") -> dict:
     """
-    AI explanation layer. Falls back to rules if API key or package is unavailable.
+    AI explanation layer. Falls back to rule-based logic if unavailable.
     """
     api_key = get_openai_api_key()
     if not OPENAI_AVAILABLE or not api_key:
@@ -274,7 +330,6 @@ Launch metadata:
             input=prompt,
         )
         parsed = json.loads(response.output_text.strip())
-
         return {
             "likely_type": parsed.get("likely_type", "Unknown sensitive payload"),
             "why_sensitive": parsed.get("why_sensitive", "Public metadata suggests a security-linked mission."),
@@ -285,165 +340,41 @@ Launch metadata:
         return classify_sensitive_launch(row)
 
 
+# =========================
 # DATA LOADING
+# =========================
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
 def get_upcoming_launches():
-    url = "https://ll.thespacedevs.com/2.2.0/launch/upcoming/?limit=15&mode=detailed"
-    @st.cache_data(ttl=300)
-def fetch_json_with_retry(url, timeout=45, retries=3):
-    last_error = None
-
-    for attempt in range(retries):
-        try:
-            response = requests.get(url, timeout=timeout)
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as e:
-            last_error = e
-
-    raise last_error
-
-
-@st.cache_data(ttl=300)
-def get_upcoming_launches():
-    url = "https://ll.thespacedevs.com/2.2.0/launch/upcoming/?limit=15&mode=detailed"
+    url = f"https://ll.thespacedevs.com/2.2.0/launch/upcoming/?limit={UPCOMING_LIMIT}&mode=detailed"
     raw = fetch_json_with_retry(url)["results"]
 
-    rows = []
-    for item in raw:
-        pad = item.get("pad") or {}
-        location = pad.get("location") or {}
-
-        rows.append(
-            {
-                "name": item.get("name"),
-                "net": item.get("net"),
-                "status": item.get("status", {}).get("name") if item.get("status") else None,
-                "provider": item.get("launch_service_provider", {}).get("name")
-                if item.get("launch_service_provider")
-                else None,
-                "rocket": item.get("rocket", {}).get("configuration", {}).get("name")
-                if item.get("rocket") and item.get("rocket", {}).get("configuration")
-                else None,
-                "mission_type": item.get("mission", {}).get("type") if item.get("mission") else None,
-                "location_name": location.get("name"),
-                "country_code": location.get("country_code"),
-                "lat": pd.to_numeric(pad.get("latitude"), errors="coerce"),
-                "lon": pd.to_numeric(pad.get("longitude"), errors="coerce"),
-            }
-        )
-
-    df = pd.DataFrame(rows)
+    df = build_launch_rows(raw, include_coordinates=True)
     df = clean_time_col(df, "net")
+
     if not df.empty:
         df = df.sort_values("net")
+
     return df
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
 def get_recent_launches():
-    url = "https://ll.thespacedevs.com/2.2.0/launch/previous/?limit=40&mode=detailed"
+    url = f"https://ll.thespacedevs.com/2.2.0/launch/previous/?limit={RECENT_LIMIT}&mode=detailed"
     raw = fetch_json_with_retry(url)["results"]
 
-    rows = []
-    for item in raw:
-        pad = item.get("pad") or {}
-        location = pad.get("location") or {}
-
-        rows.append(
-            {
-                "name": item.get("name"),
-                "net": item.get("net"),
-                "status": item.get("status", {}).get("name") if item.get("status") else None,
-                "provider": item.get("launch_service_provider", {}).get("name")
-                if item.get("launch_service_provider")
-                else None,
-                "rocket": item.get("rocket", {}).get("configuration", {}).get("name")
-                if item.get("rocket") and item.get("rocket", {}).get("configuration")
-                else None,
-                "mission_type": item.get("mission", {}).get("type") if item.get("mission") else None,
-                "location_name": location.get("name"),
-                "country_code": location.get("country_code"),
-            }
-        )
-
-    df = pd.DataFrame(rows)
+    df = build_launch_rows(raw, include_coordinates=False)
     df = clean_time_col(df, "net")
+
     if not df.empty:
         df = df.sort_values("net", ascending=False)
-    return df
-    response.raise_for_status()
-    raw = response.json()["results"]
 
-    rows = []
-    for item in raw:
-        pad = item.get("pad") or {}
-        location = pad.get("location") or {}
-
-        rows.append(
-            {
-                "name": item.get("name"),
-                "net": item.get("net"),
-                "status": item.get("status", {}).get("name") if item.get("status") else None,
-                "provider": item.get("launch_service_provider", {}).get("name")
-                if item.get("launch_service_provider")
-                else None,
-                "rocket": item.get("rocket", {}).get("configuration", {}).get("name")
-                if item.get("rocket") and item.get("rocket", {}).get("configuration")
-                else None,
-                "mission_type": item.get("mission", {}).get("type") if item.get("mission") else None,
-                "location_name": location.get("name"),
-                "country_code": location.get("country_code"),
-                "lat": pd.to_numeric(pad.get("latitude"), errors="coerce"),
-                "lon": pd.to_numeric(pad.get("longitude"), errors="coerce"),
-            }
-        )
-
-    df = pd.DataFrame(rows)
-    df = clean_time_col(df, "net")
-    if not df.empty:
-        df = df.sort_values("net")
     return df
 
 
-@st.cache_data(ttl=300)
-def get_recent_launches():
-    url = "https://ll.thespacedevs.com/2.2.0/launch/previous/?limit=60&mode=detailed"
-    response = requests.get(url, timeout=20)
-    response.raise_for_status()
-    raw = response.json()["results"]
-
-    rows = []
-    for item in raw:
-        pad = item.get("pad") or {}
-        location = pad.get("location") or {}
-
-        rows.append(
-            {
-                "name": item.get("name"),
-                "net": item.get("net"),
-                "status": item.get("status", {}).get("name") if item.get("status") else None,
-                "provider": item.get("launch_service_provider", {}).get("name")
-                if item.get("launch_service_provider")
-                else None,
-                "rocket": item.get("rocket", {}).get("configuration", {}).get("name")
-                if item.get("rocket") and item.get("rocket", {}).get("configuration")
-                else None,
-                "mission_type": item.get("mission", {}).get("type") if item.get("mission") else None,
-                "location_name": location.get("name"),
-                "country_code": location.get("country_code"),
-            }
-        )
-
-    df = pd.DataFrame(rows)
-    df = clean_time_col(df, "net")
-    if not df.empty:
-        df = df.sort_values("net", ascending=False)
-    return df
-
-
+# =========================
 # LOAD DATA
+# =========================
 
 launch_error = None
 recent_launch_error = None
@@ -461,7 +392,9 @@ except Exception as e:
     recent_launch_error = str(e)
 
 
+# =========================
 # DERIVED TABLES
+# =========================
 
 failed_launches_df = pd.DataFrame()
 sensitive_launches_df = pd.DataFrame()
@@ -476,6 +409,7 @@ if not recent_launches_df.empty:
         .str.lower()
         .apply(lambda x: any(word in x for word in failed_keywords))
     )
+
     failed_launches_df = recent_launches_df[failed_mask].copy()
     failed_launches_df = failed_launches_df[
         failed_launches_df["net"] >= now_utc - pd.Timedelta(days=30)
@@ -509,7 +443,9 @@ if not recent_launches_df.empty:
     ].copy()
 
 
+# =========================
 # STATUS CARDS
+# =========================
 
 st.subheader("System Status")
 
@@ -525,15 +461,19 @@ with c3:
     st.metric("Sensitive Launches", len(sensitive_launches_df))
 
 with c4:
-    if launch_error:
-        st.error("Launch Feed Offline")
+    if launch_error and recent_launch_error:
+        st.error("Feeds Degraded")
+    elif launch_error or recent_launch_error:
+        st.warning("Partial Feed Issues")
     else:
-        st.success("Launch Feed Online")
+        st.success("Launch Feeds Online")
 
 st.divider()
 
 
-# MAP + OVERVIEW PANEL
+# =========================
+# MAP + OVERVIEW
+# =========================
 
 left, right = st.columns([1.5, 1])
 
@@ -541,11 +481,13 @@ with left:
     st.subheader("Launch Site Map")
 
     if launch_error:
-        st.error(f"Launch map unavailable: {launch_error}")
+        st.warning("Upcoming launch map is temporarily unavailable from the upstream API.")
+        st.caption("The provider did not respond in time. Try refreshing in a minute.")
     elif launches_df.empty:
         st.info("No launch data available right now.")
     else:
         map_df = launches_df.dropna(subset=["lat", "lon"]).copy()
+
         if map_df.empty:
             st.info("No launch coordinates available right now.")
         else:
@@ -565,7 +507,7 @@ with right:
     st.subheader("Launch Overview")
 
     if launch_error:
-        st.error("Live launch feed is currently unavailable.")
+        st.warning("Live upcoming launch monitoring is temporarily unavailable.")
     else:
         st.success("Live launch monitoring is active.")
 
@@ -586,18 +528,22 @@ with right:
 st.divider()
 
 
+# =========================
 # UPCOMING LAUNCHES
+# =========================
 
 st.subheader("Upcoming Launches")
 
 if launch_error:
-    st.error(f"Launch feed unavailable: {launch_error}")
+    st.warning("Upcoming launch feed is temporarily unavailable from the upstream API.")
+    st.caption("The provider did not respond in time. Try refreshing in a minute.")
 elif launches_df.empty:
     st.info("No upcoming launches available.")
 else:
     nice_launches = launches_df[
         ["name", "net", "status", "provider", "rocket", "mission_type", "location_name"]
     ].copy()
+
     nice_launches = nice_launches.rename(
         columns={
             "name": "Launch",
@@ -609,23 +555,28 @@ else:
             "location_name": "Location",
         }
     )
+
     st.dataframe(nice_launches, use_container_width=True, hide_index=True)
 
 st.divider()
 
 
+# =========================
 # RECENT FAILED LAUNCHES
+# =========================
 
 st.subheader("Recent Failed Launches")
 
 if recent_launch_error:
-    st.error(f"Recent launch history unavailable: {recent_launch_error}")
+    st.warning("Recent launch history is temporarily unavailable from the upstream API.")
+    st.caption("The provider did not respond in time. Try refreshing in a minute.")
 elif failed_launches_df.empty:
     st.success("No failed launches found in the last 30 days.")
 else:
     failed_display = failed_launches_df[
         ["name", "net", "status", "provider", "rocket", "mission_type", "location_name"]
     ].copy()
+
     failed_display = failed_display.rename(
         columns={
             "name": "Launch",
@@ -637,24 +588,31 @@ else:
             "location_name": "Location",
         }
     )
+
     st.dataframe(failed_display, use_container_width=True, hide_index=True)
 
 st.divider()
 
 
+# =========================
 # SENSITIVE LAUNCHES
+# =========================
 
 st.subheader("Publicly Labeled Sensitive Launches")
-st.caption("This section uses public labels and metadata only. It does not identify undisclosed or covert launches.")
+st.caption(
+    "This section uses public labels and metadata only. It does not identify undisclosed or covert launches."
+)
 
 if recent_launch_error:
-    st.error(f"Recent launch history unavailable: {recent_launch_error}")
+    st.warning("Recent launch history is temporarily unavailable from the upstream API.")
+    st.caption("Sensitive launch detection depends on that feed.")
 elif sensitive_launches_df.empty:
     st.info("No publicly labeled sensitive launches found in the last 90 days.")
 else:
     sensitive_display = sensitive_launches_df[
         ["name", "net", "status", "provider", "rocket", "mission_type", "location_name"]
     ].copy()
+
     sensitive_display = sensitive_display.rename(
         columns={
             "name": "Launch",
@@ -666,12 +624,15 @@ else:
             "location_name": "Location",
         }
     )
+
     st.dataframe(sensitive_display, use_container_width=True, hide_index=True)
 
 st.divider()
 
 
+# =========================
 # AI INFERENCE ON SENSITIVE LAUNCHES
+# =========================
 
 st.subheader("AI Inference on Sensitive Launches")
 st.caption(
@@ -679,7 +640,7 @@ st.caption(
 )
 
 if recent_launch_error:
-    st.error(f"Recent launch history unavailable: {recent_launch_error}")
+    st.warning("AI inference is unavailable because recent launch history could not be loaded.")
 elif sensitive_launches_df.empty:
     st.info("No sensitive launches available for AI inference.")
 else:
@@ -731,25 +692,32 @@ else:
 st.divider()
 
 
+# =========================
 # ANALYST SUMMARY
+# =========================
 
 st.subheader("Analyst Summary")
 
-if launch_error:
-    st.markdown("""
-- Launch feed is currently unavailable.
-- The dashboard layout is online, but live data sources need attention.
-""")
+if launch_error and recent_launch_error:
+    st.markdown(
+        """
+- Upstream launch feeds are currently responding slowly or timing out.
+- The dashboard layout is working.
+- Retry logic is enabled, but the external provider may still be temporarily unavailable.
+"""
+    )
 else:
     next_launch_name = safe_text(launches_df.iloc[0]["name"]) if not launches_df.empty else "No launch available"
     next_launch_time = safe_text(launches_df.iloc[0]["net"]) if not launches_df.empty else "N/A"
 
-    st.markdown(f"""
+    st.markdown(
+        f"""
 - **{len(launches_df)}** upcoming launch records are currently loaded.
 - **{len(failed_launches_df)}** failed launches were found in the last 30 days.
 - **{len(sensitive_launches_df)}** publicly labeled sensitive launches were found in the last 90 days.
 - The **next scheduled launch** is **{next_launch_name}**.
 - The next launch time is **{next_launch_time}**.
-- The launch layer is operational.
+- Retry-based API loading is enabled for better resilience.
 - Sensitive-mission inference is enabled with rule-based logic and optional AI explanation support.
-""")
+"""
+    )
